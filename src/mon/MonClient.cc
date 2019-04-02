@@ -12,7 +12,14 @@
  * 
  */
 
+#include <algorithm>
+#include <iterator>
 #include <random>
+#include <boost/range/adaptor/map.hpp>
+#include <boost/range/adaptor/filtered.hpp>
+#include <boost/range/algorithm/copy.hpp>
+#include <boost/range/algorithm_ext/copy_n.hpp>
+#include "common/weighted_shuffle.h"
 
 #include "include/scope_guard.h"
 #include "include/stringify.h"
@@ -367,8 +374,8 @@ void MonClient::handle_monmap(MMonMap *m)
   ldout(cct, 10) << __func__ << " " << *m << dendl;
   auto con_addrs = m->get_source_addrs();
   string old_name = monmap.get_name(con_addrs);
+  const auto old_epoch = monmap.get_epoch();
 
-  // NOTE: we're not paying attention to the epoch, here.
   auto p = m->monmapbl.cbegin();
   decode(monmap, p);
 
@@ -380,21 +387,24 @@ void MonClient::handle_monmap(MMonMap *m)
   monmap.print(*_dout);
   *_dout << dendl;
 
+  if (old_epoch != monmap.get_epoch()) {
+    tried.clear();
+  }
   if (old_name.size() == 0) {
     ldout(cct,10) << " can't identify which mon we were connected to" << dendl;
     _reopen_session();
   } else {
-    int new_rank = monmap.get_rank(m->get_source_addr());
-    if (new_rank < 0) {
-      ldout(cct, 10) << "mon." << new_rank << " at " << m->get_source_addrs()
+    auto new_name = monmap.get_name(con_addrs);
+    if (new_name.empty()) {
+      ldout(cct, 10) << "mon." << old_name << " at " << con_addrs
 		     << " went away" << dendl;
       // can't find the mon we were talking to (above)
       _reopen_session();
     } else if (messenger->should_use_msgr2() &&
-	       monmap.get_addrs(new_rank).has_msgr2() &&
+	       monmap.get_addrs(new_name).has_msgr2() &&
 	       !con_addrs.has_msgr2()) {
-      ldout(cct,1) << " mon." << new_rank << " has (v2) addrs "
-		   << monmap.get_addrs(new_rank) << " but i'm connected to "
+      ldout(cct,1) << " mon." << new_name << " has (v2) addrs "
+		   << monmap.get_addrs(new_name) << " but i'm connected to "
 		   << con_addrs << ", reconnecting" << dendl;
       _reopen_session();
     }
@@ -687,27 +697,56 @@ MonConnection& MonClient::_add_conn(unsigned rank, uint64_t global_id)
 
 void MonClient::_add_conns(uint64_t global_id)
 {
-  uint16_t min_priority = std::numeric_limits<uint16_t>::max();
-  for (const auto& m : monmap.mon_info) {
-    if (m.second.priority < min_priority) {
-      min_priority = m.second.priority;
+  // collect the next batch of candidates who are listed right next to the ones
+  // already tried
+  auto get_next_batch = [this]() -> vector<unsigned> {
+    multimap<uint16_t, unsigned> ranks_by_priority;
+    boost::copy(monmap.mon_info | boost::adaptors::filtered([this](auto& info) {
+                  auto rank = monmap.get_rank(info.first);
+                  return tried.count(rank) == 0;
+                }) | boost::adaptors::transformed([this](auto& info) {
+                  auto rank = monmap.get_rank(info.first);
+                  return make_pair(info.second.priority, rank);
+                }), std::inserter(ranks_by_priority, end(ranks_by_priority)));
+    if (ranks_by_priority.empty()) {
+      return {};
+    }
+    // only choose the monitors with lowest priority
+    auto cands = boost::make_iterator_range(
+      ranks_by_priority.equal_range(ranks_by_priority.begin()->first));
+    vector<unsigned> ranks;
+    boost::range::copy(cands | boost::adaptors::map_values,
+		       std::back_inserter(ranks));
+    return ranks;
+  };
+  auto ranks = get_next_batch();
+  if (ranks.empty()) {
+    tried.clear();  // start over
+    ranks = get_next_batch();
+  }
+  ceph_assert(!ranks.empty());
+  if (ranks.size() > 1) {
+    vector<uint16_t> weights;
+    for (auto i : ranks) {
+      auto rank_name = monmap.get_name(i);
+      weights.push_back(monmap.get_weight(rank_name));
+    }
+    std::random_device rd;
+    if (std::accumulate(begin(weights), end(weights), 0u) == 0) {
+      std::shuffle(begin(ranks), end(ranks), std::mt19937{rd()});
+    } else {
+      weighted_shuffle(begin(ranks), end(ranks), begin(weights), end(weights),
+		       std::mt19937{rd()});
     }
   }
-  vector<unsigned> ranks;
-  for (const auto& m : monmap.mon_info) {
-    if (m.second.priority == min_priority) {
-      ranks.push_back(monmap.get_rank(m.first));
-    }
-  }
-  std::random_device rd;
-  std::mt19937 rng(rd());
-  std::shuffle(ranks.begin(), ranks.end(), rng);
+  ldout(cct, 10) << __func__ << " ranks=" << ranks << dendl;
   unsigned n = cct->_conf->mon_client_hunt_parallel;
   if (n == 0 || n > ranks.size()) {
     n = ranks.size();
   }
   for (unsigned i = 0; i < n; i++) {
     _add_conn(ranks[i], global_id);
+    tried.insert(ranks[i]);
   }
 }
 
@@ -1602,14 +1641,8 @@ int MonConnection::handle_auth_bad_method(
   auto p = std::find(auth_supported.begin(), auth_supported.end(),
 		     old_auth_method);
   assert(p != auth_supported.end());
-
-  while (p != auth_supported.end()) {
-    ++p;
-    if (std::find(allowed_methods.begin(), allowed_methods.end(), *p) !=
-	allowed_methods.end()) {
-      break;
-    }
-  }
+  p = std::find_first_of(std::next(p), auth_supported.end(),
+			 allowed_methods.begin(), allowed_methods.end());
   if (p == auth_supported.end()) {
     lderr(cct) << __func__ << " server allowed_methods " << allowed_methods
 	       << " but i only support " << auth_supported << dendl;

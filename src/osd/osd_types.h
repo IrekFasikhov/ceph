@@ -133,9 +133,6 @@ struct osd_reqid_t {
   osd_reqid_t()
     : tid(0), inc(0)
   {}
-  osd_reqid_t(const osd_reqid_t& other)
-    : name(other.name), tid(other.tid), inc(other.inc)
-  {}
   osd_reqid_t(const entity_name_t& a, int i, ceph_tid_t t)
     : name(a), tid(t), inc(i)
   {}
@@ -963,6 +960,7 @@ WRITE_CLASS_ENCODER_FEATURES(objectstore_perf_stat_t)
 #define PG_STATE_SNAPTRIM_ERROR     (1ULL << 29) // error stopped trimming snaps
 #define PG_STATE_FORCED_RECOVERY    (1ULL << 30) // force recovery of this pg before any other
 #define PG_STATE_FORCED_BACKFILL    (1ULL << 31) // force backfill of this pg before any other
+#define PG_STATE_FAILED_REPAIR      (1ULL << 32) // A repair failed to fix all errors
 
 std::string pg_state_string(uint64_t state);
 std::string pg_vector_string(const vector<int32_t> &a);
@@ -1018,6 +1016,7 @@ public:
     PG_NUM_MIN,         // min pg_num
     TARGET_SIZE_BYTES,  // total bytes in pool
     TARGET_SIZE_RATIO,  // fraction of total cluster
+    PG_AUTOSCALE_BIAS,
   };
 
   enum type_t {
@@ -1079,6 +1078,45 @@ private:
   friend ostream& operator<<(ostream& out, const pool_opts_t& opts);
 };
 WRITE_CLASS_ENCODER_FEATURES(pool_opts_t)
+
+struct pg_merge_meta_t {
+  pg_t source_pgid;
+  epoch_t ready_epoch = 0;
+  epoch_t last_epoch_started = 0;
+  epoch_t last_epoch_clean = 0;
+  eversion_t source_version;
+  eversion_t target_version;
+
+  void encode(bufferlist& bl) const {
+    ENCODE_START(1, 1, bl);
+    encode(source_pgid, bl);
+    encode(ready_epoch, bl);
+    encode(last_epoch_started, bl);
+    encode(last_epoch_clean, bl);
+    encode(source_version, bl);
+    encode(target_version, bl);
+    ENCODE_FINISH(bl);
+  }
+  void decode(bufferlist::const_iterator& p) {
+    DECODE_START(1, p);
+    decode(source_pgid, p);
+    decode(ready_epoch, p);
+    decode(last_epoch_started, p);
+    decode(last_epoch_clean, p);
+    decode(source_version, p);
+    decode(target_version, p);
+    DECODE_FINISH(p);
+  }
+  void dump(Formatter *f) const {
+    f->dump_stream("source_pgid") << source_pgid;
+    f->dump_unsigned("ready_epoch", ready_epoch);
+    f->dump_unsigned("last_epoch_started", last_epoch_started);
+    f->dump_unsigned("last_epoch_clean", last_epoch_clean);
+    f->dump_stream("source_version") << source_version;
+    f->dump_stream("target_version") << target_version;
+  }
+};
+WRITE_CLASS_ENCODER(pg_merge_meta_t)
 
 /*
  * pg_pool
@@ -1306,10 +1344,9 @@ public:
   /// last epoch that forced clients to resend (pre-luminous clients only)
   epoch_t last_force_op_resend_preluminous = 0;
 
-  /// last_epoch_started preceding pg_num decrement request
-  epoch_t pg_num_dec_last_epoch_started = 0;
-  /// last_epoch_clean preceding pg_num decrement request
-  epoch_t pg_num_dec_last_epoch_clean = 0;
+  /// metadata for the most recent PG merge
+  pg_merge_meta_t last_pg_merge_meta;
+  
   snapid_t snap_seq;        ///< seq for per-pool snapshot
   epoch_t snap_epoch;       ///< osdmap epoch of last snap
   uint64_t auid;            ///< who owns the pg
@@ -1565,13 +1602,6 @@ public:
   // pool size that it represents.
   unsigned get_pg_num_divisor(pg_t pgid) const;
 
-  epoch_t get_pg_num_dec_last_epoch_started() const {
-    return pg_num_dec_last_epoch_started;
-  }
-  epoch_t get_pg_num_dec_last_epoch_clean() const {
-    return pg_num_dec_last_epoch_clean;
-  }
-
   bool is_pending_merge(pg_t pgid, bool *target) const;
 
   void set_pg_num(int p) {
@@ -1593,11 +1623,19 @@ public:
   void set_pgp_num_target(int p) {
     pgp_num_target = p;
   }
-  void dec_pg_num(epoch_t last_epoch_started,
+  void dec_pg_num(pg_t source_pgid,
+		  epoch_t ready_epoch,
+		  eversion_t source_version,
+		  eversion_t target_version,
+		  epoch_t last_epoch_started,
 		  epoch_t last_epoch_clean) {
     --pg_num;
-    pg_num_dec_last_epoch_started = last_epoch_started;
-    pg_num_dec_last_epoch_clean = last_epoch_clean;
+    last_pg_merge_meta.source_pgid = source_pgid;
+    last_pg_merge_meta.ready_epoch = ready_epoch;
+    last_pg_merge_meta.source_version = source_version;
+    last_pg_merge_meta.target_version = target_version;
+    last_pg_merge_meta.last_epoch_started = last_epoch_started;
+    last_pg_merge_meta.last_epoch_clean = last_epoch_clean;
     calc_pg_masks();
   }
 
@@ -1736,6 +1774,7 @@ struct object_stat_sum_t {
   int64_t num_objects_manifest = 0;
   int64_t num_omap_bytes = 0;
   int64_t num_omap_keys = 0;
+  int64_t num_objects_repaired = 0;
 
   object_stat_sum_t()
     : num_bytes(0),
@@ -1808,6 +1847,7 @@ struct object_stat_sum_t {
     FLOOR(num_evict_mode_full);
     FLOOR(num_objects_pinned);
     FLOOR(num_legacy_snapsets);
+    FLOOR(num_objects_repaired);
 #undef FLOOR
   }
 
@@ -1844,6 +1884,7 @@ struct object_stat_sum_t {
     SPLIT(num_objects_manifest);
     SPLIT(num_omap_bytes);
     SPLIT(num_omap_keys);
+    SPLIT(num_objects_repaired);
     SPLIT_PRESERVE_NONZERO(num_shallow_scrub_errors);
     SPLIT_PRESERVE_NONZERO(num_deep_scrub_errors);
     for (unsigned i = 0; i < out.size(); ++i) {
@@ -1908,6 +1949,7 @@ struct object_stat_sum_t {
         sizeof(num_objects_manifest) +
         sizeof(num_omap_bytes) +
         sizeof(num_omap_keys) +
+        sizeof(num_objects_repaired) +
         sizeof(num_objects_recovered) +
         sizeof(num_bytes_recovered) +
         sizeof(num_keys_recovered) +
@@ -2280,6 +2322,7 @@ struct osd_stat_t {
   store_statfs_t statfs;
   vector<int> hb_peers;
   int32_t snap_trim_queue_len, num_snap_trimming;
+  uint64_t num_shards_repaired;
 
   pow2_hist_t op_queue_age_hist;
 
@@ -2291,12 +2334,14 @@ struct osd_stat_t {
 
   uint32_t num_pgs = 0;
 
-  osd_stat_t() : snap_trim_queue_len(0), num_snap_trimming(0) {}
+  osd_stat_t() : snap_trim_queue_len(0), num_snap_trimming(0),
+       num_shards_repaired(0)	{}
 
  void add(const osd_stat_t& o) {
     statfs.add(o.statfs);
     snap_trim_queue_len += o.snap_trim_queue_len;
     num_snap_trimming += o.num_snap_trimming;
+    num_shards_repaired += o.num_shards_repaired;
     op_queue_age_hist.add(o.op_queue_age_hist);
     os_perf_stat.add(o.os_perf_stat);
     num_pgs += o.num_pgs;
@@ -2311,6 +2356,7 @@ struct osd_stat_t {
     statfs.sub(o.statfs);
     snap_trim_queue_len -= o.snap_trim_queue_len;
     num_snap_trimming -= o.num_snap_trimming;
+    num_shards_repaired -= o.num_shards_repaired;
     op_queue_age_hist.sub(o.op_queue_age_hist);
     os_perf_stat.sub(o.os_perf_stat);
     num_pgs -= o.num_pgs;
@@ -2335,6 +2381,7 @@ inline bool operator==(const osd_stat_t& l, const osd_stat_t& r) {
   return l.statfs == r.statfs &&
     l.snap_trim_queue_len == r.snap_trim_queue_len &&
     l.num_snap_trimming == r.num_snap_trimming &&
+    l.num_shards_repaired == r.num_shards_repaired &&
     l.hb_peers == r.hb_peers &&
     l.op_queue_age_hist == r.op_queue_age_hist &&
     l.os_perf_stat == r.os_perf_stat &&
@@ -2428,8 +2475,11 @@ struct pool_stat_t {
       allocated_bytes = store_stats.allocated;
     } else {
       // legacy mode, use numbers from 'stats'
-      allocated_bytes = stats.sum.num_bytes;
+      allocated_bytes = stats.sum.num_bytes +
+	stats.sum.num_bytes_hit_set_archive;
     }
+    // omap is not broken out by pool by nautilus bluestore
+    allocated_bytes += stats.sum.num_omap_bytes;
     return allocated_bytes;
   }
   uint64_t get_user_bytes(float raw_used_rate) const {
@@ -2438,8 +2488,11 @@ struct pool_stat_t {
       user_bytes = raw_used_rate ? store_stats.data_stored / raw_used_rate : 0;
     } else {
       // legacy mode, use numbers from 'stats'
-       user_bytes = stats.sum.num_bytes;
+      user_bytes = stats.sum.num_bytes +
+	stats.sum.num_bytes_hit_set_archive;
     }
+    // omap is not broken out by pool by nautilus bluestore
+    user_bytes += stats.sum.num_omap_bytes;
     return user_bytes;
   }
 

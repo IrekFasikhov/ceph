@@ -16,12 +16,15 @@ from ..rest_client import RequestException
 from ..security import Scope
 from ..services.iscsi_client import IscsiClient
 from ..services.iscsi_cli import IscsiGatewaysConfig
+from ..services.rbd import format_bitmask
 from ..exceptions import DashboardException
 from ..tools import TaskManager
 
 
 @UiApiController('/iscsi', Scope.ISCSI)
 class IscsiUi(BaseController):
+
+    REQUIRED_CEPH_ISCSI_CONFIG_VERSION = 8
 
     @Endpoint()
     @ReadPermission
@@ -31,7 +34,12 @@ class IscsiUi(BaseController):
             status['message'] = 'There are no gateways defined'
             return status
         try:
-            IscsiClient.instance().get_config()
+            config = IscsiClient.instance().get_config()
+            if config['version'] != IscsiUi.REQUIRED_CEPH_ISCSI_CONFIG_VERSION:
+                status['message'] = 'Unsupported `ceph-iscsi` config version. Expected {} but ' \
+                                    'found {}.'.format(IscsiUi.REQUIRED_CEPH_ISCSI_CONFIG_VERSION,
+                                                       config['version'])
+                return status
             status['available'] = True
         except RequestException as e:
             if e.content:
@@ -73,16 +81,10 @@ class Iscsi(BaseController):
 
     def _get_discoveryauth(self):
         config = IscsiClient.instance().get_config()
-        user = ''
-        password = ''
-        chap = config['discovery_auth']['chap']
-        if chap:
-            user, password = chap.split('/')
-        mutual_user = ''
-        mutual_password = ''
-        chap_mutual = config['discovery_auth']['chap_mutual']
-        if chap_mutual:
-            mutual_user, mutual_password = chap_mutual.split('/')
+        user = config['discovery_auth']['username']
+        password = config['discovery_auth']['password']
+        mutual_user = config['discovery_auth']['mutual_username']
+        mutual_password = config['discovery_auth']['mutual_password']
         return {
             'user': user,
             'password': password,
@@ -349,14 +351,39 @@ class IscsiTarget(RESTController):
         for disk in disks:
             pool = disk['pool']
             image = disk['image']
-            IscsiTarget._validate_image_exists(pool, image)
+            backstore = disk['backstore']
+            required_rbd_features = settings['required_rbd_features'][backstore]
+            supported_rbd_features = settings['supported_rbd_features'][backstore]
+            IscsiTarget._validate_image(pool, image, backstore, required_rbd_features,
+                                        supported_rbd_features)
 
     @staticmethod
-    def _validate_image_exists(pool, image):
+    def _validate_image(pool, image, backstore, required_rbd_features, supported_rbd_features):
         try:
             ioctx = mgr.rados.open_ioctx(pool)
             try:
-                rbd.Image(ioctx, image)
+                with rbd.Image(ioctx, image) as img:
+                    if img.features() & required_rbd_features != required_rbd_features:
+                        raise DashboardException(msg='Image {} cannot be exported using {} '
+                                                     'backstore because required features are '
+                                                     'missing (required features are '
+                                                     '{})'.format(image,
+                                                                  backstore,
+                                                                  format_bitmask(
+                                                                      required_rbd_features)),
+                                                 code='image_missing_required_features',
+                                                 component='iscsi')
+                    if img.features() & supported_rbd_features != img.features():
+                        raise DashboardException(msg='Image {} cannot be exported using {} '
+                                                     'backstore because it contains unsupported '
+                                                     'features (supported features are '
+                                                     '{})'.format(image,
+                                                                  backstore,
+                                                                  format_bitmask(
+                                                                      supported_rbd_features)),
+                                                 code='image_contains_unsupported_features',
+                                                 component='iscsi')
+
             except rbd.ImageNotFound:
                 raise DashboardException(msg='Image {} does not exist'.format(image),
                                          code='image_does_not_exist',
@@ -425,12 +452,10 @@ class IscsiTarget(RESTController):
                             target_iqn, client_iqn, image_id)
                     user = client['auth']['user']
                     password = client['auth']['password']
-                    chap = '{}/{}'.format(user, password) if user and password else ''
                     m_user = client['auth']['mutual_user']
                     m_password = client['auth']['mutual_password']
-                    m_chap = '{}/{}'.format(m_user, m_password) if m_user and m_password else ''
                     IscsiClient.instance(gateway_name=gateway_name).create_client_auth(
-                        target_iqn, client_iqn, chap, m_chap)
+                        target_iqn, client_iqn, user, password, m_user, m_password)
                 TaskManager.current_task().inc_progress(task_progress_inc)
             for group in groups:
                 group_id = group['group_id']
@@ -490,14 +515,10 @@ class IscsiTarget(RESTController):
                     'image': image
                 }
                 luns.append(lun)
-            user = None
-            password = None
-            if '/' in client_config['auth']['chap']:
-                user, password = client_config['auth']['chap'].split('/', 1)
-            mutual_user = None
-            mutual_password = None
-            if '/' in client_config['auth']['chap_mutual']:
-                mutual_user, mutual_password = client_config['auth']['chap_mutual'].split('/', 1)
+            user = client_config['auth']['username']
+            password = client_config['auth']['password']
+            mutual_user = client_config['auth']['mutual_username']
+            mutual_password = client_config['auth']['mutual_password']
             client = {
                 'client_iqn': client_iqn,
                 'luns': luns,

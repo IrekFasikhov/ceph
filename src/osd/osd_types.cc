@@ -381,6 +381,7 @@ void osd_stat_t::dump(Formatter *f) const
   f->close_section();
   f->dump_int("snap_trim_queue_len", snap_trim_queue_len);
   f->dump_int("num_snap_trimming", num_snap_trimming);
+  f->dump_int("num_shards_repaired", num_shards_repaired);
   f->open_object_section("op_queue_age_hist");
   op_queue_age_hist.dump(f);
   f->close_section();
@@ -394,7 +395,7 @@ void osd_stat_t::dump(Formatter *f) const
 
 void osd_stat_t::encode(bufferlist &bl, uint64_t features) const
 {
-  ENCODE_START(10, 2, bl);
+  ENCODE_START(11, 2, bl);
 
   //////// for compatibility ////////
   int64_t kb = statfs.kb();
@@ -425,6 +426,7 @@ void osd_stat_t::encode(bufferlist &bl, uint64_t features) const
   encode(statfs, bl);
   ///////////////////////////////////
   encode(os_alerts, bl);
+  encode(num_shards_repaired, bl);
   ENCODE_FINISH(bl);
 }
 
@@ -432,7 +434,7 @@ void osd_stat_t::decode(bufferlist::const_iterator &bl)
 {
   int64_t kb, kb_used,kb_avail;
   int64_t kb_used_data, kb_used_omap, kb_used_meta;
-  DECODE_START_LEGACY_COMPAT_LEN(10, 2, 2, bl);
+  DECODE_START_LEGACY_COMPAT_LEN(11, 2, 2, bl);
   decode(kb, bl);
   decode(kb_used, bl);
   decode(kb_avail, bl);
@@ -487,6 +489,11 @@ void osd_stat_t::decode(bufferlist::const_iterator &bl)
   } else {
     os_alerts.clear();
   }
+  if (struct_v >= 11) {
+    decode(num_shards_repaired, bl);
+  } else {
+    num_shards_repaired = 0;
+  }
   DECODE_FINISH(bl);
 }
 
@@ -501,6 +508,7 @@ void osd_stat_t::generate_test_instances(std::list<osd_stat_t*>& o)
   o.back()->hb_peers.push_back(7);
   o.back()->snap_trim_queue_len = 8;
   o.back()->num_snap_trimming = 99;
+  o.back()->num_shards_repaired = 101;
   o.back()->os_alerts[0].emplace(
     "some alert", "some alert details");
   o.back()->os_alerts[1].emplace(
@@ -976,6 +984,8 @@ std::string pg_state_string(uint64_t state)
     oss << "snaptrim_wait+";
   if (state & PG_STATE_SNAPTRIM_ERROR)
     oss << "snaptrim_error+";
+  if (state & PG_STATE_FAILED_REPAIR)
+    oss << "failed_repair+";
   string ret(oss.str());
   if (ret.length() > 0)
     ret.resize(ret.length() - 1);
@@ -1047,6 +1057,8 @@ boost::optional<uint64_t> pg_string_state(const std::string& state)
     type = PG_STATE_SNAPTRIM_ERROR;
   else if (state == "creating")
     type = PG_STATE_CREATING;
+  else if (state == "failed_repair")
+    type = PG_STATE_FAILED_REPAIR;
   else if (state == "unknown")
     type = 0;
   else
@@ -1146,7 +1158,9 @@ static opt_mapping_t opt_mapping = boost::assign::map_list_of
            ("target_size_bytes", pool_opts_t::opt_desc_t(
 	     pool_opts_t::TARGET_SIZE_BYTES, pool_opts_t::INT))
            ("target_size_ratio", pool_opts_t::opt_desc_t(
-	     pool_opts_t::TARGET_SIZE_RATIO, pool_opts_t::DOUBLE));
+	     pool_opts_t::TARGET_SIZE_RATIO, pool_opts_t::DOUBLE))
+           ("pg_autoscale_bias", pool_opts_t::opt_desc_t(
+	     pool_opts_t::PG_AUTOSCALE_BIAS, pool_opts_t::DOUBLE));
 
 bool pool_opts_t::is_opt_name(const std::string& name)
 {
@@ -1337,10 +1351,7 @@ void pg_pool_t::dump(Formatter *f) const
   f->dump_unsigned("pg_placement_num_target", get_pgp_num_target());
   f->dump_unsigned("pg_num_target", get_pg_num_target());
   f->dump_unsigned("pg_num_pending", get_pg_num_pending());
-  f->dump_unsigned("pg_num_dec_last_epoch_started",
-		   get_pg_num_dec_last_epoch_started());
-  f->dump_unsigned("pg_num_dec_last_epoch_clean",
-		   get_pg_num_dec_last_epoch_clean());
+  f->dump_object("last_pg_merge_meta", last_pg_merge_meta);
   f->dump_stream("last_change") << get_last_change();
   f->dump_stream("last_force_op_resend") << get_last_force_op_resend();
   f->dump_stream("last_force_op_resend_prenautilus")
@@ -1747,7 +1758,7 @@ void pg_pool_t::encode(bufferlist& bl, uint64_t features) const
     return;
   }
 
-  uint8_t v = 28;
+  uint8_t v = 29;
   // NOTE: any new encoding dependencies must be reflected by
   // SIGNIFICANT_FEATURES
   if (!(features & CEPH_FEATURE_NEW_OSDOP_ENCODING)) {
@@ -1842,17 +1853,20 @@ void pg_pool_t::encode(bufferlist& bl, uint64_t features) const
     encode(pg_num_target, bl);
     encode(pgp_num_target, bl);
     encode(pg_num_pending, bl);
-    encode(pg_num_dec_last_epoch_started, bl);
-    encode(pg_num_dec_last_epoch_clean, bl);
+    encode((epoch_t)0, bl);  // pg_num_dec_last_epoch_started from 14.1.[01]
+    encode((epoch_t)0, bl);  // pg_num_dec_last_epoch_clean from 14.1.[01]
     encode(last_force_op_resend, bl);
     encode(pg_autoscale_mode, bl);
+  }
+  if (v >= 29) {
+    encode(last_pg_merge_meta, bl);
   }
   ENCODE_FINISH(bl);
 }
 
 void pg_pool_t::decode(bufferlist::const_iterator& bl)
 {
-  DECODE_START_LEGACY_COMPAT_LEN(28, 5, 5, bl);
+  DECODE_START_LEGACY_COMPAT_LEN(29, 5, 5, bl);
   decode(type, bl);
   decode(size, bl);
   decode(crush_rule, bl);
@@ -2009,10 +2023,17 @@ void pg_pool_t::decode(bufferlist::const_iterator& bl)
     decode(pg_num_target, bl);
     decode(pgp_num_target, bl);
     decode(pg_num_pending, bl);
-    decode(pg_num_dec_last_epoch_started, bl);
-    decode(pg_num_dec_last_epoch_clean, bl);
+    epoch_t old_merge_last_epoch_clean, old_merge_last_epoch_started;
+    decode(old_merge_last_epoch_started, bl);
+    decode(old_merge_last_epoch_clean, bl);
     decode(last_force_op_resend, bl);
     decode(pg_autoscale_mode, bl);
+    if (struct_v >= 29) {
+      decode(last_pg_merge_meta, bl);
+    } else {
+      last_pg_merge_meta.last_epoch_clean = old_merge_last_epoch_clean;
+      last_pg_merge_meta.last_epoch_started = old_merge_last_epoch_started;
+    }
   } else {
     pg_num_target = pg_num;
     pgp_num_target = pgp_num;
@@ -2040,8 +2061,8 @@ void pg_pool_t::generate_test_instances(list<pg_pool_t*>& o)
   a.pgp_num_target = 4;
   a.pg_num_target = 5;
   a.pg_num_pending = 5;
-  a.pg_num_dec_last_epoch_started = 2;
-  a.pg_num_dec_last_epoch_clean = 3;
+  a.last_pg_merge_meta.last_epoch_started = 2;
+  a.last_pg_merge_meta.last_epoch_clean = 2;
   a.last_change = 9;
   a.last_force_op_resend = 123823;
   a.last_force_op_resend_preluminous = 123824;
@@ -2112,10 +2133,6 @@ ostream& operator<<(ostream& out, const pg_pool_t& p)
   }
   if (p.get_pg_num_pending() != p.get_pg_num()) {
     out << " pg_num_pending " << p.get_pg_num_pending();
-    if (p.get_pg_num_dec_last_epoch_started() ||
-	p.get_pg_num_dec_last_epoch_clean())
-      out << " dles/c " << p.get_pg_num_dec_last_epoch_started()
-	  << "/" << p.get_pg_num_dec_last_epoch_clean();
   }
   if (p.pg_autoscale_mode) {
     out << " autoscale_mode " << p.get_pg_autoscale_mode_name(p.pg_autoscale_mode);
@@ -2222,11 +2239,12 @@ void object_stat_sum_t::dump(Formatter *f) const
   f->dump_int("num_objects_manifest", num_objects_manifest);
   f->dump_int("num_omap_bytes", num_omap_bytes);
   f->dump_int("num_omap_keys", num_omap_keys);
+  f->dump_int("num_objects_repaired", num_objects_repaired);
 }
 
 void object_stat_sum_t::encode(bufferlist& bl) const
 {
-  ENCODE_START(19, 14, bl);
+  ENCODE_START(20, 14, bl);
 #if defined(CEPH_LITTLE_ENDIAN)
   bl.append((char *)(&num_bytes), sizeof(object_stat_sum_t));
 #else
@@ -2269,6 +2287,7 @@ void object_stat_sum_t::encode(bufferlist& bl) const
   encode(num_objects_manifest, bl);
   encode(num_omap_bytes, bl);
   encode(num_omap_keys, bl);
+  encode(num_objects_repaired, bl);
 #endif
   ENCODE_FINISH(bl);
 }
@@ -2276,7 +2295,7 @@ void object_stat_sum_t::encode(bufferlist& bl) const
 void object_stat_sum_t::decode(bufferlist::const_iterator& bl)
 {
   bool decode_finish = false;
-  DECODE_START(19, bl);  // make sure to also update fast decode below
+  DECODE_START(20, bl);  // make sure to also update fast decode below
 #if defined(CEPH_LITTLE_ENDIAN)
   if (struct_v >= 19) {  // this must match newest decode version
     bl.copy(sizeof(object_stat_sum_t), (char*)(&num_bytes));
@@ -2333,6 +2352,9 @@ void object_stat_sum_t::decode(bufferlist::const_iterator& bl)
       decode(num_omap_bytes, bl);
       decode(num_omap_keys, bl);
     }
+    if (struct_v >= 20) {
+      decode(num_objects_repaired, bl);
+    }
   }
   DECODE_FINISH(bl);
 }
@@ -2376,6 +2398,7 @@ void object_stat_sum_t::generate_test_instances(list<object_stat_sum_t*>& o)
   a.num_objects_manifest = 2;
   a.num_omap_bytes = 20000;
   a.num_omap_keys = 200;
+  a.num_objects_repaired = 300;
   o.push_back(new object_stat_sum_t(a));
 }
 
@@ -2420,6 +2443,7 @@ void object_stat_sum_t::add(const object_stat_sum_t& o)
   num_objects_manifest += o.num_objects_manifest;
   num_omap_bytes += o.num_omap_bytes;
   num_omap_keys += o.num_omap_keys;
+  num_objects_repaired += o.num_objects_repaired;
 }
 
 void object_stat_sum_t::sub(const object_stat_sum_t& o)
@@ -2463,6 +2487,7 @@ void object_stat_sum_t::sub(const object_stat_sum_t& o)
   num_objects_manifest -= o.num_objects_manifest;
   num_omap_bytes -= o.num_omap_bytes;
   num_omap_keys -= o.num_omap_keys;
+  num_objects_repaired -= o.num_objects_repaired;
 }
 
 bool operator==(const object_stat_sum_t& l, const object_stat_sum_t& r)
@@ -2506,7 +2531,8 @@ bool operator==(const object_stat_sum_t& l, const object_stat_sum_t& r)
     l.num_large_omap_objects == r.num_large_omap_objects &&
     l.num_objects_manifest == r.num_objects_manifest &&
     l.num_omap_bytes == r.num_omap_bytes &&
-    l.num_omap_keys == r.num_omap_keys;
+    l.num_omap_keys == r.num_omap_keys &&
+    l.num_objects_repaired == r.num_objects_repaired;
 }
 
 // -- object_stat_collection_t --
